@@ -47,21 +47,37 @@ from statistics import median
 SIZE_HEADER = 0x38  # 56 bytes
 SIZE_RECORD = 0x28  # 40 bytes
 
-def deserialize_datetime(excel_date_time):
-    """Convert SCID datetime (Excel format) to Python datetime."""
+# Sierra Chart epoch — SCID dt_raw is int64 microseconds since this UTC moment.
+SIERRA_EPOCH = datetime(1899, 12, 30)
+
+
+def scid_dt_raw_to_datetime(dt_raw):
+    """Convert SCID raw int64 microsecond timestamp to naive datetime.
+
+    Use this in preference to deserialize_datetime — it avoids the float
+    roundtrip and is exact to microsecond precision.
+    """
     try:
-        date_tok = int(excel_date_time)
-        time_tok = round(86400 * (excel_date_time - date_tok))
-        d = date(1899, 12, 30) + timedelta(date_tok)
-        
-        factor = time_tok / 86399.99
-        hours = int((factor * 24) % 24)
-        minutes = int((factor * 24 * 60) % 60)
-        seconds = int((factor * 24 * 60 * 60) % 60)
-        
-        t = time(hours, minutes, seconds, 0)
-        return datetime.combine(d, t)
-    except:
+        return SIERRA_EPOCH + timedelta(microseconds=dt_raw)
+    except (OverflowError, ValueError):
+        return None
+
+
+def deserialize_datetime(excel_date_time):
+    """Convert SCID datetime (Excel days-since-1899-12-30 float) to Python datetime.
+
+    Legacy interface kept for external callers. Internally now uses the
+    corrected microsecond-direct path. The previous implementation had a
+    rounding-overflow bug at midnight boundaries: a tick at 23:59:59.999998
+    decoded as 00:00:00 of the SAME day, producing duplicate-timestamp ticks
+    on the last record of every day. Returns naive datetime truncated to
+    second precision (matching the legacy contract).
+    """
+    try:
+        microseconds = round(excel_date_time * 86400 * 1_000_000)
+        dt = SIERRA_EPOCH + timedelta(microseconds=microseconds)
+        return dt.replace(microsecond=0)
+    except (OverflowError, ValueError):
         return None
 
 def process_chunk(input_file, start_record, num_records):
@@ -90,10 +106,10 @@ def process_chunk(input_file, start_record, num_records):
                 break
             
             dt_raw, o, h, l, c, vol, trades, bid_vol, ask_vol = struct.unpack('<q4f4I', data)
-            
-            # SCID datetime is microseconds since epoch
-            dt_days = dt_raw / 1000000.0 / 86400.0
-            dt = deserialize_datetime(dt_days)
+
+            # SCID datetime is microseconds since SIERRA_EPOCH; direct
+            # arithmetic (no float roundtrip) avoids the midnight rounding bug.
+            dt = scid_dt_raw_to_datetime(dt_raw)
             
             if dt is None or c <= 0:
                 continue
@@ -133,9 +149,8 @@ def process_chunk(input_file, start_record, num_records):
                     actual_vol = unbundled_vol
                     in_unbundled_trade = False
                     
-                    # Recalculate datetime for output
-                    dt_days = dt_raw / 1000000.0 / 86400.0
-                    dt = deserialize_datetime(dt_days)
+                    # Recalculate datetime for output (using FIRST sub's dt_raw).
+                    dt = scid_dt_raw_to_datetime(dt_raw)
                 else:
                     # Middle sub-trade, keep accumulating
                     continue
@@ -761,9 +776,10 @@ def parse_arguments():
         'raw': False,
         'output_dir': 'NT8_Imports',
         'workers': None,
-        'file_pattern': None
+        'file_pattern': None,
+        'from_year': None,
     }
-    
+
     i = 4
     while i < len(sys.argv):
         arg = sys.argv[i]
@@ -787,6 +803,13 @@ def parse_arguments():
             except ValueError:
                 print("Error: Workers must be an integer")
                 sys.exit(1)
+        elif arg == '--from-year' and i + 1 < len(sys.argv):
+            yy = sys.argv[i + 1].strip()
+            if not (yy.isdigit() and len(yy) == 2):
+                print("Error: --from-year takes a 2-digit year (e.g. 15 for 2015)")
+                sys.exit(1)
+            options['from_year'] = yy
+            i += 2
         else:
             # For single file mode, capture the filename
             if work_type == 'single':
@@ -798,8 +821,36 @@ def parse_arguments():
     
     return contract, folder, work_type, options
 
+_MONTH_CODE_MAP = {'F':1,'G':2,'H':3,'J':4,'K':5,'M':6,'N':7,'Q':8,'U':9,'V':10,'X':11,'Z':12}
+
+
+def nt8_output_filename(file_path, contract):
+    """Return NT8-compliant filename ('CONTRACT MM-YY.txt') for a SCID input.
+
+    Uses len(contract) as the offset into the basename so it works for any
+    symbol length (ES=2, MGC=3, etc.)."""
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    offset = len(contract)
+    if len(base) >= offset + 3:
+        month_num = _MONTH_CODE_MAP.get(base[offset], 1)
+        year = base[offset + 1:offset + 3]
+        return f"{contract} {month_num:02d}-{year}.txt"
+    return f"{base}.txt"
+
+
+def scid_year(file_path, contract):
+    """Extract 2-digit year suffix from a SCID basename, e.g. 'ESH25-CME' -> '25'."""
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    offset = len(contract)
+    return base[offset + 1:offset + 3] if len(base) >= offset + 3 else ''
+
+
 def execute_work(contract, folder, work_type, options):
     """Execute the requested work type."""
+    # Isolate each contract's output in a per-ticker subfolder so re-runs of
+    # different contracts don't share a directory.
+    options['output_dir'] = os.path.join(options['output_dir'], contract)
+
     print(f"Contract: {contract}")
     print(f"Folder: {folder}")
     print(f"Work Type: {work_type}")
@@ -819,19 +870,9 @@ def execute_work(contract, folder, work_type, options):
         if options['raw']:
             convert_scid_to_nt8(file_path, num_workers=options['workers'])
         else:
-            # Generate output file path
-            base = os.path.splitext(os.path.basename(file_path))[0]
-            if len(base) >= 6:
-                month_code = base[3]
-                year = base[4:6]
-                month_map = {'F':1,'G':2,'H':3,'J':4,'K':5,'M':6,'N':7,'Q':8,'U':9,'V':10,'X':11,'Z':12}
-                month_num = month_map.get(month_code, 1)
-                output_file = os.path.join(options['output_dir'], f"{contract} {month_num:02d}-{year}.txt")
-            else:
-                output_file = os.path.join(options['output_dir'], f"{base}.txt")
-            
+            output_file = os.path.join(options['output_dir'], nt8_output_filename(file_path, contract))
             convert_and_clean(
-                file_path, 
+                file_path,
                 output_file=output_file,
                 contract_name=contract,
                 threshold=options['threshold'],
@@ -842,11 +883,16 @@ def execute_work(contract, folder, work_type, options):
         # Batch convert files for contract in folder
         pattern = f"{contract}*.scid"
         files = glob.glob(os.path.join(folder, pattern))
-        
+
+        if options.get('from_year'):
+            fy = options['from_year']
+            files = [f for f in files if scid_year(f, contract) >= fy]
+            print(f"Year filter --from-year {fy}: {len(files)} files match")
+
         if not files:
             print(f"No {contract} files found in {folder}")
             sys.exit(1)
-        
+
         print(f"Found {len(files)} {contract} files to convert...")
         
         for file_path in files:
@@ -858,17 +904,22 @@ def execute_work(contract, folder, work_type, options):
             else:
                 convert_and_clean(
                     file_path,
-                    output_file=os.path.join(options['output_dir'], f"{contract} {os.path.splitext(os.path.basename(file_path))[0]}.txt"),
+                    output_file=os.path.join(options['output_dir'], nt8_output_filename(file_path, contract)),
                     contract_name=contract,
                     threshold=options['threshold'],
                     num_workers=options['workers']
                 )
-    
+
     elif work_type == 'all':
         # Convert all files for contract (recursive)
         pattern = f"{contract}*.scid"
         files = glob.glob(os.path.join(folder, '**', pattern), recursive=True)
-        
+
+        if options.get('from_year'):
+            fy = options['from_year']
+            files = [f for f in files if scid_year(f, contract) >= fy]
+            print(f"Year filter --from-year {fy}: {len(files)} files match")
+
         if not files:
             print(f"No {contract} files found in {folder} (recursive)")
             sys.exit(1)
@@ -885,12 +936,12 @@ def execute_work(contract, folder, work_type, options):
             else:
                 convert_and_clean(
                     file_path,
-                    output_file=os.path.join(options['output_dir'], f"{contract} {os.path.splitext(os.path.basename(file_path))[0]}.txt"),
+                    output_file=os.path.join(options['output_dir'], nt8_output_filename(file_path, contract)),
                     contract_name=contract,
                     threshold=options['threshold'],
                     num_workers=options['workers']
                 )
-    
+
     else:
         print(f"Error: Unknown work type '{work_type}'")
         print("Valid work types: single, batch, all")
